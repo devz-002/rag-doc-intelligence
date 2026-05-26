@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import gc
+import os
+import re
+from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from pypdf import PdfReader
 import streamlit as st
 
 try:
-    from .ingest import DATA_DIR, ingest_pdfs
+    from .ingest import DATA_DIR, VECTORSTORE_DIR, ingest_pdfs
     from .model_config import get_chat_model_config, get_embedding_model_name, has_chat_api_key
     from .retriever import (
         format_sources,
@@ -17,7 +22,7 @@ try:
     )
     from .vectorstore_utils import VectorstoreAccessError, close_chroma_client
 except ImportError:
-    from ingest import DATA_DIR, ingest_pdfs
+    from ingest import DATA_DIR, VECTORSTORE_DIR, ingest_pdfs
     from model_config import get_chat_model_config, get_embedding_model_name, has_chat_api_key
     from retriever import (
         format_sources,
@@ -31,6 +36,27 @@ except ImportError:
 st.set_page_config(page_title="RAG Document Intelligence", layout="wide")
 
 OPENROUTER_FREE_MODELS_URL = "https://openrouter.ai/models?max_price=0"
+DEFAULT_MAX_PDF_UPLOAD_MB = 100
+SAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+MAX_PDF_UPLOAD_MB = positive_int_env("MAX_PDF_UPLOAD_MB", DEFAULT_MAX_PDF_UPLOAD_MB)
+MAX_PDF_UPLOAD_BYTES = MAX_PDF_UPLOAD_MB * 1024 * 1024
+STREAMLIT_MAX_UPLOAD_MB = positive_int_env("STREAMLIT_SERVER_MAX_UPLOAD_SIZE", 200)
+
+
+@dataclass(frozen=True)
+class UploadSaveResult:
+    saved_paths: list[Path]
+    errors: list[str]
 
 
 @st.cache_resource(show_spinner=False)
@@ -75,17 +101,85 @@ def format_question_error(exc: Exception) -> str:
     return error_text
 
 
-def save_uploaded_pdfs(uploaded_files: list[Any]) -> list[Path]:
+def ensure_runtime_directories() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    VECTORSTORE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def safe_pdf_filename(filename: str) -> str:
+    raw_name = Path(filename or "uploaded.pdf").name
+    path_name = Path(raw_name)
+    stem = SAFE_FILENAME_CHARS.sub("_", path_name.stem).strip("._") or "uploaded"
+    return f"{stem}.pdf"
+
+
+def next_available_path(directory: Path, filename: str) -> Path:
+    target_path = directory / filename
+    if not target_path.exists():
+        return target_path
+
+    stem = target_path.stem
+    suffix = target_path.suffix
+    counter = 1
+    while True:
+        candidate = directory / f"{stem}_{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def validate_uploaded_pdf(uploaded_file: Any) -> str | None:
+    filename = Path(getattr(uploaded_file, "name", "") or "").name or "uploaded file"
+    if not filename.lower().endswith(".pdf"):
+        return f"{filename}: only .pdf files can be ingested."
+
+    size = getattr(uploaded_file, "size", None)
+    if size == 0:
+        return f"{filename}: the file is empty."
+    if isinstance(size, int) and size > MAX_PDF_UPLOAD_BYTES:
+        return (
+            f"{filename}: file is {size / (1024 * 1024):.1f} MB; "
+            f"the per-file limit is {MAX_PDF_UPLOAD_MB} MB."
+        )
+
+    try:
+        header = bytes(uploaded_file.getbuffer()[:5])
+    except Exception as exc:
+        return f"{filename}: could not read the upload buffer ({exc})."
+    if header != b"%PDF-":
+        return f"{filename}: this does not look like a valid PDF file."
+
+    try:
+        reader = PdfReader(BytesIO(uploaded_file.getbuffer()), strict=False)
+        if reader.is_encrypted:
+            return f"{filename}: encrypted PDFs are not supported."
+        if len(reader.pages) == 0:
+            return f"{filename}: no pages were found in the PDF."
+    except Exception as exc:
+        return f"{filename}: could not be parsed as a PDF ({exc})."
+
+    return None
+
+
+def save_uploaded_pdfs(uploaded_files: list[Any]) -> UploadSaveResult:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     saved_paths: list[Path] = []
+    errors: list[str] = []
     for uploaded_file in uploaded_files:
-        filename = Path(uploaded_file.name).name
-        if not filename.lower().endswith(".pdf"):
+        validation_error = validate_uploaded_pdf(uploaded_file)
+        if validation_error:
+            errors.append(validation_error)
             continue
-        target_path = DATA_DIR / filename
-        target_path.write_bytes(uploaded_file.getbuffer())
+        filename = safe_pdf_filename(uploaded_file.name)
+        target_path = next_available_path(DATA_DIR, filename)
+        try:
+            with target_path.open("wb") as output_file:
+                output_file.write(uploaded_file.getbuffer())
+        except OSError as exc:
+            errors.append(f"{filename}: could not save to {DATA_DIR} ({exc}).")
+            continue
         saved_paths.append(target_path)
-    return saved_paths
+    return UploadSaveResult(saved_paths=saved_paths, errors=errors)
 
 
 def run_comparison(question: str) -> dict[str, Any]:
@@ -143,30 +237,51 @@ def render_sidebar() -> tuple[bool, bool, str | None]:
             st.error(chat_error)
 
 
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        pdf_count = len(list(DATA_DIR.glob("*.pdf")))
-        st.write(f"PDFs in data/: {pdf_count}")
+        try:
+            ensure_runtime_directories()
+            pdf_count = len(list(DATA_DIR.glob("*.pdf")))
+        except OSError as exc:
+            pdf_count = 0
+            st.error(f"Could not create runtime directories: {exc}")
+
+        st.write(f"PDFs in `{DATA_DIR.name}/`: {pdf_count}")
 
         uploaded_files = st.file_uploader(
             "Upload PDF documents",
             type=["pdf"],
             accept_multiple_files=True,
         )
+        st.caption(
+            f"Accepted PDFs up to {MAX_PDF_UPLOAD_MB} MB each. "
+            f"If an upload card turns red, Streamlit rejected it before the app could save it; "
+            f"try a valid PDF below {min(MAX_PDF_UPLOAD_MB, STREAMLIT_MAX_UPLOAD_MB)} MB."
+        )
 
-        ingest_disabled = not uploaded_files and pdf_count == 0
-        if st.button("Save and ingest PDFs", disabled=ingest_disabled):
+        if st.button("Save and ingest PDFs"):
             try:
-                saved_paths = save_uploaded_pdfs(uploaded_files or [])
-                release_cached_chroma_resources()
-                stats = ingest_pdfs()
-                release_cached_chroma_resources()
-                st.success(
-                    "Ingested {pdf_files} PDF(s) into {chunks} chunks with local embeddings.".format(
-                        **stats
+                upload_result = save_uploaded_pdfs(uploaded_files or [])
+                for error in upload_result.errors:
+                    st.error(error)
+
+                has_pdfs_to_ingest = pdf_count > 0 or bool(upload_result.saved_paths)
+                if not has_pdfs_to_ingest:
+                    st.error(
+                        "No accepted PDFs are available to ingest. "
+                        "If the upload card shows a red error icon, use a smaller valid PDF and upload again."
                     )
-                )
-                if saved_paths:
-                    st.caption("Saved: " + ", ".join(path.name for path in saved_paths))
+                else:
+                    release_cached_chroma_resources()
+                    stats = ingest_pdfs()
+                    release_cached_chroma_resources()
+                    st.success(
+                        "Ingested {pdf_files} PDF(s) into {chunks} chunks with local embeddings.".format(
+                            **stats
+                        )
+                    )
+                    if upload_result.saved_paths:
+                        st.caption(
+                            "Saved: " + ", ".join(path.name for path in upload_result.saved_paths)
+                        )
             except VectorstoreAccessError as exc:
                 st.error(f"Could not ingest PDFs: {exc}")
             except Exception as exc:
