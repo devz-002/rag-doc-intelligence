@@ -1,7 +1,7 @@
 ---
 title: RAG Document Intelligence
-sdk: streamlit
-app_file: src/app.py
+sdk: docker
+app_port: 7860
 pinned: false
 ---
 
@@ -30,7 +30,9 @@ rag-doc-intelligence/
     ingest.py        # PDF ingestion and embedding
     retriever.py     # Chroma retriever and QA helpers
   .env.example
+  .dockerignore
   .gitignore
+  Dockerfile
   requirements.txt
 ```
 
@@ -126,11 +128,11 @@ Open the local Streamlit URL, upload or ingest PDFs, then ask a question. The re
 
 ## Hugging Face Spaces Deployment
 
-1. Create a new Space with the Streamlit SDK.
+1. Create a new Space with the Docker SDK.
 2. Upload this project or push it to the Space repository.
 3. Add either `OPENROUTER_API_KEY` or `OPENAI_API_KEY` as a Space secret.
 4. Add `LLM_PROVIDER` as `openrouter` or `openai`.
-5. Keep `app_file: src/app.py` in this README metadata.
+5. The `Dockerfile` installs `requirements.txt` and starts Streamlit on `0.0.0.0:7860`.
 6. Use the sidebar to upload PDFs and build the runtime vectorstore.
 
 `vectorstore/` is generated and intentionally ignored. If the Space restarts, rebuild the vectorstore from uploaded or bundled PDFs.
