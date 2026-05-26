@@ -8,11 +8,17 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from pypdf import PdfReader
 import streamlit as st
 
 try:
-    from .ingest import DATA_DIR, VECTORSTORE_DIR, ingest_pdfs
+    from .ingest import (
+        DATA_DIR,
+        PDF_TEXT_GUIDANCE,
+        VECTORSTORE_DIR,
+        ingest_pdfs,
+        inspect_pdf_text,
+        pdf_text_issue_message,
+    )
     from .model_config import get_chat_model_config, get_embedding_model_name, has_chat_api_key
     from .retriever import (
         format_sources,
@@ -22,7 +28,14 @@ try:
     )
     from .vectorstore_utils import VectorstoreAccessError, close_chroma_client
 except ImportError:
-    from ingest import DATA_DIR, VECTORSTORE_DIR, ingest_pdfs
+    from ingest import (
+        DATA_DIR,
+        PDF_TEXT_GUIDANCE,
+        VECTORSTORE_DIR,
+        ingest_pdfs,
+        inspect_pdf_text,
+        pdf_text_issue_message,
+    )
     from model_config import get_chat_model_config, get_embedding_model_name, has_chat_api_key
     from retriever import (
         format_sources,
@@ -57,6 +70,7 @@ STREAMLIT_MAX_UPLOAD_MB = positive_int_env("STREAMLIT_SERVER_MAX_UPLOAD_SIZE", 2
 class UploadSaveResult:
     saved_paths: list[Path]
     errors: list[str]
+    warnings: list[str]
 
 
 @st.cache_resource(show_spinner=False)
@@ -149,14 +163,10 @@ def validate_uploaded_pdf(uploaded_file: Any) -> str | None:
     if header != b"%PDF-":
         return f"{filename}: this does not look like a valid PDF file."
 
-    try:
-        reader = PdfReader(BytesIO(uploaded_file.getbuffer()), strict=False)
-        if reader.is_encrypted:
-            return f"{filename}: encrypted PDFs are not supported."
-        if len(reader.pages) == 0:
-            return f"{filename}: no pages were found in the PDF."
-    except Exception as exc:
-        return f"{filename}: could not be parsed as a PDF ({exc})."
+    inspection = inspect_pdf_text(BytesIO(uploaded_file.getbuffer()), source_name=filename)
+    issue = pdf_text_issue_message(inspection)
+    if issue is not None:
+        return issue
 
     return None
 
@@ -165,10 +175,14 @@ def save_uploaded_pdfs(uploaded_files: list[Any]) -> UploadSaveResult:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     saved_paths: list[Path] = []
     errors: list[str] = []
+    warnings: list[str] = []
     for uploaded_file in uploaded_files:
         validation_error = validate_uploaded_pdf(uploaded_file)
         if validation_error:
-            errors.append(validation_error)
+            if "no selectable text found" in validation_error.lower():
+                warnings.append(validation_error)
+            else:
+                errors.append(validation_error)
             continue
         filename = safe_pdf_filename(uploaded_file.name)
         target_path = next_available_path(DATA_DIR, filename)
@@ -179,7 +193,7 @@ def save_uploaded_pdfs(uploaded_files: list[Any]) -> UploadSaveResult:
             errors.append(f"{filename}: could not save to {DATA_DIR} ({exc}).")
             continue
         saved_paths.append(target_path)
-    return UploadSaveResult(saved_paths=saved_paths, errors=errors)
+    return UploadSaveResult(saved_paths=saved_paths, errors=errors, warnings=warnings)
 
 
 def run_comparison(question: str) -> dict[str, Any]:
@@ -256,18 +270,25 @@ def render_sidebar() -> tuple[bool, bool, str | None]:
             f"If an upload card turns red, Streamlit rejected it before the app could save it; "
             f"try a valid PDF below {min(MAX_PDF_UPLOAD_MB, STREAMLIT_MAX_UPLOAD_MB)} MB."
         )
+        st.caption(
+            f"{PDF_TEXT_GUIDANCE} This app intentionally avoids heavy OCR dependencies for "
+            "Hugging Face Docker Spaces."
+        )
 
         if st.button("Save and ingest PDFs"):
             try:
                 upload_result = save_uploaded_pdfs(uploaded_files or [])
                 for error in upload_result.errors:
                     st.error(error)
+                for warning in upload_result.warnings:
+                    st.warning(warning)
 
                 has_pdfs_to_ingest = pdf_count > 0 or bool(upload_result.saved_paths)
                 if not has_pdfs_to_ingest:
                     st.error(
                         "No accepted PDFs are available to ingest. "
-                        "If the upload card shows a red error icon, use a smaller valid PDF and upload again."
+                        "Check the messages above, then upload a valid searchable PDF below "
+                        f"{min(MAX_PDF_UPLOAD_MB, STREAMLIT_MAX_UPLOAD_MB)} MB."
                     )
                 else:
                     release_cached_chroma_resources()
@@ -278,6 +299,8 @@ def render_sidebar() -> tuple[bool, bool, str | None]:
                             **stats
                         )
                     )
+                    for warning in stats.get("warnings", []):
+                        st.warning(warning)
                     if upload_result.saved_paths:
                         st.caption(
                             "Saved: " + ", ".join(path.name for path in upload_result.saved_paths)
