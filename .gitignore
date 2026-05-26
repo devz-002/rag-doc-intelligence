@@ -16,3 +16,6 @@ data/*.pdf
 
 # Streamlit local state
 .streamlit/secrets.toml
+
+#KT Documentation
+.KT_DOCUMENTATION.md
