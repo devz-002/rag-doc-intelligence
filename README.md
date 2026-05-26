@@ -7,6 +7,8 @@ pinned: false
 
 # RAG Document Intelligence
 
+Live demo: https://huggingface.co/spaces/devz002/rag-doc-intelligence
+
 A Streamlit chat app for asking questions about PDF documents. It builds a ChromaDB vectorstore from PDFs using local Chroma ONNX MiniLM embeddings, answers with LangChain RetrievalQA, cites retrieved source chunks, and shows a side-by-side comparison against a plain LLM answer.
 
 ## Stack
