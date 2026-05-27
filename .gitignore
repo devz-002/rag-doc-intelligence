@@ -20,7 +20,4 @@ data/*.pdf
 #KT Documentation
 .KT_DOCUMENTATION.md
 .RAG_Resume_Bullets.md
-.Attention Is All You Need.pdf
-.DeepSeek-V3 Technical Report.pdf
-.QLORA: Efficient Finetuning of Quantized LLMs.pdf
-.RAG.pdf
+
