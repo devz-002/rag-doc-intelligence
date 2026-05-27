@@ -20,4 +20,4 @@ data/*.pdf
 #KT Documentation
 .KT_DOCUMENTATION.md
 .RAG_Resume_Bullets.md
-.*.pdf
+*.pdf
